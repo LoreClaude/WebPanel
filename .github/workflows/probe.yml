@@ -1,0 +1,49 @@
+name: probe
+
+on:
+  push:
+    paths:
+      - "probe/**"
+      - ".github/workflows/probe.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r probe/requirements.txt pyinstaller==6.11.1
+
+      - name: Smoke test (headless Chrome)
+        env:
+          PANEL6_HEADLESS: "1"
+          PANEL6_HOME: ${{ runner.temp }}\probehome
+        run: python probe/probe.py --auto
+
+      - name: Build exe
+        run: pyinstaller --onefile --console --name Panel6Probe probe/probe.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Panel6Probe
+          path: dist/Panel6Probe.exe
+
+      - name: Publish release "probe-latest"
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh release view probe-latest >/dev/null 2>&1 || \
+            gh release create probe-latest --prerelease --target "$GITHUB_SHA" \
+              --title "Пробник этапа 0 (последняя сборка)" \
+              --notes "Скачай Panel6Probe.exe и запусти. Инструкция — в README."
+          gh release upload probe-latest dist/Panel6Probe.exe --clobber

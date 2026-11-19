@@ -1,0 +1,88 @@
+name: panel
+
+on:
+  push:
+    paths:
+      - "panel6/**"
+      - "tests/**"
+      - "run_panel6.py"
+      - "requirements.txt"
+      - ".github/workflows/panel.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pytest==8.3.4 pyinstaller==6.11.1
+
+      - name: Unit tests
+        run: python -m pytest -q tests
+
+      - name: Self-test from source
+        env:
+          PANEL6_HOME: ${{ runner.temp }}\p6src
+        shell: pwsh
+        run: |
+          python run_panel6.py --selftest
+          $code = $LASTEXITCODE
+          Get-Content "$env:PANEL6_HOME\panel6.log" -ErrorAction SilentlyContinue
+          if ($code -ne 0) { throw "selftest exit code $code" }
+
+      - name: UI screenshots on Windows
+        continue-on-error: true
+        timeout-minutes: 3
+        shell: pwsh
+        env:
+          PANEL6_HOME: ${{ runner.temp }}\p6screens
+        run: |
+          python run_panel6.py --screens screens\native
+          $env:QT_QPA_PLATFORM = "offscreen"
+          python run_panel6.py --screens screens\offscreen
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: screens
+          path: screens/
+          if-no-files-found: ignore
+
+      - name: Build exe
+        run: pyinstaller --onefile --windowed --name Panel6 run_panel6.py
+
+      - name: Self-test built exe
+        shell: pwsh
+        env:
+          PANEL6_HOME: ${{ runner.temp }}\p6exe
+        run: |
+          $p = Start-Process -FilePath dist\Panel6.exe -ArgumentList "--selftest" -Wait -PassThru
+          Get-Content "$env:PANEL6_HOME\panel6.log" -ErrorAction SilentlyContinue
+          if ($p.ExitCode -ne 0) { throw "selftest exit code $($p.ExitCode)" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Panel6
+          path: dist/Panel6.exe
+
+      - name: Publish release "panel-latest"
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          title="Panel6 $(python -c 'import panel6; print(panel6.VERSION)') — последняя сборка"
+          notes="Скачай Panel6.exe и запусти. Инструкция — в README. Сборка из коммита ${GITHUB_SHA::7}."
+          gh release view panel-latest >/dev/null 2>&1 || \
+            gh release create panel-latest --target "$GITHUB_SHA" --title "$title" --notes "$notes"
+          # основной релиз: виден на главной странице репозитория и по ссылке /releases/latest
+          gh release edit panel-latest --title "$title" --notes "$notes" --prerelease=false --latest
+          gh release upload panel-latest dist/Panel6.exe --clobber
