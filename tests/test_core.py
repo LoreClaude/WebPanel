@@ -73,7 +73,7 @@ def test_config_merge_keeps_new_defaults(tmp_path):
     cfg = config.load(path)
     assert cfg["windows"][0]["name"] == "Фарм"
     assert cfg["windows"][0]["url"] == config.BOOSTEROID_URL
-    assert len(cfg["windows"]) == 5 and cfg["windows"][4]["hotkey"] == "Num5"
+    assert len(cfg["windows"]) == 1 and cfg["windows"][0]["enabled"] is True  # число окон — как сохранено
     assert cfg["hotkeys"]["grid"] == "F9" and cfg["hotkeys"]["back"] == "Num9"
     assert cfg["game_monitor"] == 0
     config.save(cfg, path)
@@ -88,6 +88,28 @@ def test_config_broken_file(tmp_path):
 
 def test_default_hotkeys_are_unique():
     cfg = config.DEFAULTS
-    keys = [w["hotkey"] for w in cfg["windows"]] + [cfg["slot6"]["hotkey"]] + list(cfg["hotkeys"].values())
+    keys = [w["hotkey"] for w in cfg["windows"] + cfg["extra_windows"]] + list(cfg["hotkeys"].values())
     combos = [parse_hotkey(k) for k in keys]
     assert len(set(combos)) == len(combos)
+
+
+def test_config_migrates_slot6_and_keeps_window_counts(tmp_path):
+    path = tmp_path / "config.json"
+    old = {"windows": [{"name": f"W{i}", "hotkey": f"Num{i}", "url": "u"} for i in range(1, 6)],
+           "slot6": {"name": "Steam", "hotkey": "Num6", "mode": "window", "window_title": "Steam"}}
+    path.write_text(json.dumps(old), encoding="utf-8")
+    cfg = config.load(path)
+    assert "slot6" not in cfg and len(cfg["windows"]) == 5
+    assert cfg["extra_windows"] == [{"name": "Steam", "hotkey": "Num6", "enabled": True, "mode": "window",
+                                     "window_title": "Steam", "desktop_strategy": "offscreen"}]
+    cfg["windows"] += [config.chrome_window(6), config.chrome_window(7)]
+    cfg["windows"][1]["enabled"] = False
+    cfg["extra_windows"].append(config.extra_window(2))
+    config.save(cfg, path)
+    again = config.load(path)
+    assert again == cfg and len(again["windows"]) == 7 and again["windows"][1]["enabled"] is False
+    assert again["windows"][6]["hotkey"] == ""  # после пятого окна клавиша не назначена
+
+    path.write_text(json.dumps({"windows": [{}] * 50, "extra_windows": []}), encoding="utf-8")
+    cfg = config.load(path)
+    assert len(cfg["windows"]) == config.MAX_WINDOWS and cfg["extra_windows"] == []

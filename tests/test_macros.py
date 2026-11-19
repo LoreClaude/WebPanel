@@ -213,9 +213,9 @@ def test_normalize_step_defaults_and_errors():
 
 def test_normalize_macro_drops_bad_steps_and_overrides():
     m = normalize_macro({"name": "A", "steps": [{"t": "wait", "ms": 10}, {"t": "nope"}],
-                         "windows": [1, 9, 3], "overrides": {"3": {"count": 5}, "7": {"count": 1}},
+                         "windows": [1, 99, 3, 9, True], "overrides": {"3": {"count": 5}, "99": {"count": 1}},
                          "repeat": {"count": 2, "gap_ms": 100}})
-    assert len(m["steps"]) == 1 and m["windows"] == [1, 3]
+    assert len(m["steps"]) == 1 and m["windows"] == [1, 3, 9] and set(m["overrides"]) == {"3"}
     assert repeat_for(m, 3) == (5, 100) and repeat_for(m, 1) == (2, 100)
 
 

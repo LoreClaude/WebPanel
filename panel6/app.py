@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import math
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QPointF, Qt, QTimer
@@ -11,12 +12,13 @@ from PySide6.QtGui import QAction, QColor, QIcon, QPainter, QPalette, QPixmap, Q
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFormLayout, QFrame,
     QGridLayout, QGroupBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox,
-    QProxyStyle, QPushButton, QStyle, QSystemTrayIcon, QTabWidget, QToolButton, QVBoxLayout, QWidget,
+    QProxyStyle, QPushButton, QScrollArea, QSpinBox, QStyle, QSystemTrayIcon, QTabWidget, QToolButton, QVBoxLayout,
+    QWidget,
 )
 
 from . import VERSION, config, win32
 from .badge import CORNERS, Badge
-from .controller import DESKTOP_SLOT, SLOTS, Controller, ordered_screens
+from .controller import Controller, ordered_screens
 from .grid import GridOverlay
 from .macro_ui import MacrosDialog, status_text
 from .macros import USER_INPUT_MODES
@@ -217,7 +219,8 @@ class SlotCard(QFrame):
         self.btn_show = QPushButton("Показать")
         self.btn_show.clicked.connect(lambda: win.ctl.activate(slot))
         row.addWidget(self.btn_show)
-        if slot != DESKTOP_SLOT:
+        self.chrome = win.ctl.is_chrome(slot)
+        if self.chrome:
             self.btn_launch = QPushButton("Запустить")
             self.btn_launch.clicked.connect(lambda: win.ctl.launch(slot))
             self.btn_full = QPushButton("⛶")
@@ -229,7 +232,7 @@ class SlotCard(QFrame):
         self.macro_combo = None
         self.macro_line = ElidedLabel()  # текст ошибки макроса бывает длинным
         self.macro_line.setObjectName("dim")
-        if slot != DESKTOP_SLOT:
+        if self.chrome:
             mrow = QHBoxLayout()
             self.macro_combo = QComboBox()
             self.macro_combo.setToolTip("Основной макрос окна: запускается кнопкой ▶ и клавишей старт/пауза")
@@ -266,27 +269,26 @@ class SlotCard(QFrame):
     def refresh(self, status: str, current: bool) -> None:
         ctl = self.win.ctl
         self.title.setText(f"{self.slot}. {ctl.slot_name(self.slot)}")
-        hk = ctl.cfg["slot6"]["hotkey"] if self.slot == DESKTOP_SLOT else ctl.cfg["windows"][self.slot - 1]["hotkey"]
-        self.hotkey.setText(hk)
-        if self.slot == DESKTOP_SLOT and ctl.cfg["slot6"]["mode"] == "desktop":
+        self.hotkey.setText(ctl.slot_hotkey(self.slot))
+        if ctl.is_desktop(self.slot):
             text, color = "рабочий стол", STATUS_COLOR["ready"]
         else:
             text, color = STATUS_TEXT.get(status, status), STATUS_COLOR.get(status, "#97A5B4")
         self.status.setText(f"● {text}")
         self.status.setStyleSheet(f"color:{color}")
-        if self.slot != DESKTOP_SLOT:
+        if self.chrome:
             self.btn_launch.setText("Запустить" if status == "off" else "Запущено")
             self.btn_launch.setEnabled(status == "off")
             self.btn_full.setEnabled(status == "ready")
         self.placeholder.setText("" if self.win.host.has(self.slot) else
-                                 ("Рабочий стол" if self.slot == DESKTOP_SLOT else STATUS_TEXT.get(status, "")))
+                                 ("Рабочий стол" if ctl.is_desktop(self.slot) else STATUS_TEXT.get(status, "")))
         self.setProperty("current", current)
         self.style().unpolish(self)
         self.style().polish(self)
         self.refresh_macro()
 
     def refresh_macro(self) -> None:
-        if self.slot == DESKTOP_SLOT:
+        if not self.chrome:
             return
         ctl = self.win.ctl
         if ctl.recording_slot == self.slot:
@@ -332,7 +334,7 @@ class MainWindow(QMainWindow):
         b_set = QPushButton("Настройки")
         b_set.clicked.connect(self.open_settings)
         self.kill_on = QCheckBox("Kill switch")
-        self.kill_on.setToolTip("Закрыть окна 1–5, как только сменится подключение к интернету "
+        self.kill_on.setToolTip("Закрыть окна Chrome, как только сменится подключение к интернету "
                                 "(VPN выключился, переподключился, сменился сервер)")
         self.kill_on.setChecked(ctl.cfg["kill_switch"].get("enabled", True))
         self.kill_on.toggled.connect(self._kill_switch_toggled)
@@ -385,12 +387,14 @@ class MainWindow(QMainWindow):
         bar2.addWidget(b_stop_all)
         lay.addLayout(bar2)
 
-        cards = QGridLayout()
-        cards.setSpacing(10)
-        self.cards = [SlotCard(s, self) for s in range(1, SLOTS + 1)]
-        for i, c in enumerate(self.cards):
-            cards.addWidget(c, i // 3, i % 3)
-        lay.addLayout(cards, 1)
+        self.cards_box = QGridLayout()
+        self.cards_box.setSpacing(10)
+        self.cards: list[SlotCard] = []
+        self.no_cards = QLabel("Все окна выключены. Включи их в «Настройки → Окна Chrome» или «Рабочий стол и программы».")
+        self.no_cards.setObjectName("dim")
+        self.no_cards.setAlignment(Qt.AlignCenter)
+        self.build_cards()
+        lay.addLayout(self.cards_box, 1)
         self.events = EventLog()
         lay.addWidget(self.events)
         self.setCentralWidget(root)
@@ -437,6 +441,24 @@ class MainWindow(QMainWindow):
         self.raise_()
         self.activateWindow()
 
+    def build_cards(self) -> None:
+        """Карточки только для включённых окон; столбцов — 3, а если окон больше девяти — 4 и больше."""
+        for c in self.cards:
+            self.cards_box.removeWidget(c)
+            c.deleteLater()
+        self.cards_box.removeWidget(self.no_cards)
+        self.no_cards.hide()
+        slots = self.ctl.enabled_slots()
+        self.cards = [SlotCard(s, self) for s in slots]
+        self.card_by_slot = {c.slot: c for c in self.cards}
+        cols = max(3, math.ceil(math.sqrt(len(slots))))
+        for i, c in enumerate(self.cards):
+            self.cards_box.addWidget(c, i // cols, i % cols)
+        if not self.cards:
+            self.cards_box.addWidget(self.no_cards, 0, 0)
+            self.no_cards.show()
+        self.host.clear()
+
     def refresh_all(self) -> None:
         for c in self.cards:
             c.refresh(self.ctl.statuses.get(c.slot, "off"), c.slot == self.ctl.history.current)
@@ -457,8 +479,9 @@ class MainWindow(QMainWindow):
             c.refresh_macro_list()
 
     def _macro_status(self, slot: int, st: dict) -> None:
-        if 1 <= slot <= len(self.cards):
-            self.cards[slot - 1].refresh_macro()
+        card = self.card_by_slot.get(slot)
+        if card:
+            card.refresh_macro()
         self._log_macro(slot, st)
 
     def _log_macro(self, slot: int, st: dict) -> None:
@@ -489,7 +512,7 @@ class MainWindow(QMainWindow):
                 continue  # первое состояние после запуска панели не пишем
             who = self.ctl.slot_name(slot)
             if status == "ready":
-                self.events.add(f"{who}: работает" if slot != DESKTOP_SLOT else f"{who}: окно найдено")
+                self.events.add(f"{who}: работает" if self.ctl.is_chrome(slot) else f"{who}: окно найдено")
             elif status == "off" and prev in ("ready", "missing"):
                 self.events.add(f"{who}: окно закрылось", warn=True)
             elif status == "missing":
@@ -525,7 +548,7 @@ class MainWindow(QMainWindow):
         if not self.isVisible() or self.isMinimized():
             self.host.clear()
             return
-        self.host.sync({s: self.ctl.slot_hwnd(s) for s in range(1, SLOTS + 1)})
+        self.host.sync({c.slot: self.ctl.slot_hwnd(c.slot) for c in self.cards})
         for c in self.cards:
             self.host.place(c.slot, c.thumb)
             c.placeholder.setVisible(not self.host.has(c.slot))
@@ -649,13 +672,31 @@ class MainWindow(QMainWindow):
         self.ctl.switch_preset(name)
 
     # ------------------------------------------------------------ настройки
+    def _layout_key(self) -> tuple:
+        """Что влияет на набор карточек: число окон, какие включены и какого они вида."""
+        cfg = self.ctl.cfg
+        return (tuple(bool(w.get("enabled", True)) for w in cfg["windows"]),
+                tuple((bool(x.get("enabled", True)), x.get("mode")) for x in cfg["extra_windows"]))
+
     def open_settings(self) -> None:
         current_ip = self.ctl.netguard.state.public if self.ctl.netguard else None
         dlg = SettingsDialog(self.ctl.cfg, self, current_ip=current_ip)
         if dlg.exec() == QDialog.Accepted:
+            layout_before = self._layout_key()
             self.ctl.cfg.clear()
             self.ctl.cfg.update(dlg.result_cfg)
             config.save(self.ctl.cfg)
+            if self._layout_key() != layout_before:
+                self.ctl.sync_windows()
+                self._status_seen.clear()
+                self.build_cards()
+                self.refresh_macros()
+                if self.macros_dialog:  # в редакторе макросов список окон — пересоздать
+                    self.macros_dialog.flush()
+                    self.macros_dialog.close()
+                    self.macros_dialog.deleteLater()
+                    self.macros_dialog = None
+                self.ctl.refresh()
             self.ctl.start_hotkeys()
             self.kill_on.blockSignals(True)
             self.kill_on.setChecked(self.ctl.cfg["kill_switch"]["enabled"])
@@ -676,46 +717,40 @@ class SettingsDialog(QDialog):
         self.result_cfg = self.cfg
         tabs = QTabWidget()
 
-        # --- окна
-        w_tab = QWidget()
-        w_lay = QVBoxLayout(w_tab)
-        self.win_rows = []
-        for i, w in enumerate(self.cfg["windows"], start=1):
-            box = QGroupBox(f"Окно {i}")
-            f = QFormLayout(box)
-            name, url, hk = QLineEdit(w["name"]), QLineEdit(w["url"]), HotkeyEdit(w["hotkey"])
-            f.addRow("Название", name)
-            f.addRow("Адрес страницы", url)
-            f.addRow("Клавиша", hk)
-            w_lay.addWidget(box)
-            self.win_rows.append((name, url, hk))
-        tabs.addTab(w_tab, "Окна 1–5")
+        # --- окна Chrome: сколько угодно, каждое можно выключить
+        self.win_rows: list[dict] = []
+        self.win_count = QSpinBox()
+        self.win_count.setRange(0, config.MAX_WINDOWS)
+        self.win_list = QVBoxLayout()
+        tabs.addTab(self._list_tab(
+            "Окон Chrome", self.win_count, self.win_list,
+            "У каждого окна Chrome свой профиль и свой вход в аккаунт. Выключенное окно не запускается кнопкой "
+            "«Запустить все окна», его нет на панели, в сетке и в переборе по кругу, а клавиша не занята; "
+            "настройки и профиль сохраняются. Уменьшишь число окон — лишние окна панель перестанет показывать, "
+            "но их профили останутся."), "Окна Chrome")
+        for w in self.cfg["windows"]:
+            self._add_win_row(w)
+        self.win_count.setValue(len(self.cfg["windows"]))
+        self.win_count.valueChanged.connect(self._win_count_changed)
+        self._win_count_changed(self.win_count.value())
 
-        # --- шестое окно
-        s_tab = QWidget()
-        s = QFormLayout(s_tab)
-        s6 = self.cfg["slot6"]
-        self.s6_name = QLineEdit(s6["name"])
-        self.s6_hotkey = HotkeyEdit(s6["hotkey"])
-        self.s6_mode = QComboBox()
-        self.s6_mode.addItem("Рабочий стол Windows", "desktop")
-        self.s6_mode.addItem("Окно программы", "window")
-        self.s6_mode.setCurrentIndex(0 if s6["mode"] == "desktop" else 1)
-        self.s6_title = QComboBox()
-        self.s6_title.setEditable(True)
-        titles = sorted({win32.window_title(h) for h in win32.top_windows()} - {""})
-        self.s6_title.addItems(titles)
-        self.s6_title.setCurrentText(s6["window_title"])
-        self.s6_strategy = QComboBox()
-        self.s6_strategy.addItem("Сдвигать окна Chrome за край экрана (игра не замирает)", "offscreen")
-        self.s6_strategy.addItem("Сворачивать окна Chrome (игра замирает)", "minimize")
-        self.s6_strategy.setCurrentIndex(0 if s6["desktop_strategy"] == "offscreen" else 1)
-        s.addRow("Название", self.s6_name)
-        s.addRow("Клавиша", self.s6_hotkey)
-        s.addRow("Что это", self.s6_mode)
-        s.addRow("Часть заголовка окна", self.s6_title)
-        s.addRow("Как показывать рабочий стол", self.s6_strategy)
-        tabs.addTab(s_tab, "Окно 6")
+        # --- рабочие столы и окна программ
+        self._titles = sorted({win32.window_title(h) for h in win32.top_windows()} - {""})
+        self.extra_rows: list[dict] = []
+        self.extra_count = QSpinBox()
+        self.extra_count.setRange(0, config.MAX_EXTRA)
+        self.extra_list = QVBoxLayout()
+        tabs.addTab(self._list_tab(
+            "Окон «рабочий стол / программа»", self.extra_count, self.extra_list,
+            "Эти окна идут после окон Chrome. «Рабочий стол Windows» убирает окна Chrome с экрана, "
+            "«Окно программы» находит окно по части заголовка (например, Steam). "
+            "Можно сделать несколько таких окон, у каждого своя клавиша, и выключить ненужные."),
+            "Рабочий стол и программы")
+        for x in self.cfg["extra_windows"]:
+            self._add_extra_row(x)
+        self.extra_count.setValue(len(self.cfg["extra_windows"]))
+        self.extra_count.valueChanged.connect(self._extra_count_changed)
+        self._extra_count_changed(self.extra_count.value())
 
         # --- клавиши и мониторы
         k_tab = QWidget()
@@ -797,7 +832,7 @@ class SettingsDialog(QDialog):
         n_tab = QWidget()
         n = QFormLayout(n_tab)
         ks = self.cfg["kill_switch"]
-        self.ks_on = QCheckBox("Закрывать окна 1–5, когда меняется подключение к интернету")
+        self.ks_on = QCheckBox("Закрывать окна Chrome, когда меняется подключение к интернету")
         self.ks_on.setChecked(ks.get("enabled", True))
         self.ks_public = QCheckBox("Проверять и внешний IP")
         self.ks_public.setChecked(ks.get("public_ip", True))
@@ -826,8 +861,8 @@ class SettingsDialog(QDialog):
         n.addRow(every_row)
         n.addRow("Разрешённый внешний IP", allowed_row)
         n_note = QLabel(
-            "Окна закрываются сразу (процессы Chrome завершаются), макросы останавливаются, рабочий стол и окно 6 "
-            "не трогаются. Срабатывает, когда:\n"
+            "Окна закрываются сразу (процессы Chrome завершаются), макросы останавливаются, рабочие столы и окна "
+            "программ не трогаются. Срабатывает, когда:\n"
             "• сменился путь в интернет — VPN выключился, включился, переподключился, Wi-Fi сменился на кабель "
             "или связь пропала. Windows сообщает об этом сразу, и окна закрываются раньше, чем Chrome начнёт "
             "переподключаться; запросов в сеть эта проверка не делает;\n"
@@ -853,6 +888,108 @@ class SettingsDialog(QDialog):
         lay.addWidget(tabs)
         lay.addWidget(buttons)
 
+    # ------------------------------------------------------------ списки окон
+    @staticmethod
+    def _list_tab(label: str, count: QSpinBox, rows: QVBoxLayout, hint: str) -> QWidget:
+        tab = QWidget()
+        lay = QVBoxLayout(tab)
+        top = QHBoxLayout()
+        top.addWidget(QLabel(label))
+        top.addWidget(count)
+        top.addStretch(1)
+        lay.addLayout(top)
+        note = QLabel(hint)
+        note.setWordWrap(True)
+        note.setObjectName("dim")
+        lay.addWidget(note)
+        inner = QWidget()
+        rows.setContentsMargins(0, 0, 6, 0)
+        inner.setLayout(rows)
+        rows.addStretch(1)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setWidget(inner)
+        lay.addWidget(scroll, 1)
+        return tab
+
+    @staticmethod
+    def _insert(rows: QVBoxLayout, box: QWidget) -> None:
+        rows.insertWidget(rows.count() - 1, box)  # перед растяжкой в конце
+
+    def _add_win_row(self, w: dict) -> None:
+        i = len(self.win_rows) + 1
+        box = QGroupBox(f"Окно {i}")
+        f = QFormLayout(box)
+        on = QCheckBox("Включено")
+        on.setChecked(w.get("enabled", True))
+        name, url, hk = QLineEdit(w["name"]), QLineEdit(w["url"]), HotkeyEdit(w["hotkey"])
+        f.addRow(on)
+        f.addRow("Название", name)
+        f.addRow("Адрес страницы", url)
+        f.addRow("Клавиша", hk)
+        for wid in (name, url, hk):
+            on.toggled.connect(wid.setEnabled)
+            wid.setEnabled(on.isChecked())
+        self._insert(self.win_list, box)
+        self.win_rows.append({"box": box, "src": w, "enabled": on, "name": name, "url": url, "hotkey": hk})
+
+    def _win_count_changed(self, n: int) -> None:
+        while len(self.win_rows) < n:
+            self._add_win_row(config.chrome_window(len(self.win_rows) + 1))
+        for i, row in enumerate(self.win_rows):
+            row["box"].setVisible(i < n)
+
+    def _add_extra_row(self, x: dict) -> None:
+        i = len(self.extra_rows) + 1
+        box = QGroupBox()
+        f = QFormLayout(box)
+        on = QCheckBox("Включено")
+        on.setChecked(x.get("enabled", True))
+        name, hk = QLineEdit(x["name"]), HotkeyEdit(x["hotkey"])
+        mode = QComboBox()
+        mode.addItem("Рабочий стол Windows", "desktop")
+        mode.addItem("Окно программы", "window")
+        mode.setCurrentIndex(0 if x.get("mode") == "desktop" else 1)
+        title = QComboBox()
+        title.setEditable(True)
+        title.addItems(self._titles)
+        title.setCurrentText(x.get("window_title", ""))
+        strategy = QComboBox()
+        strategy.addItem("Сдвигать окна Chrome за край экрана (игра не замирает)", "offscreen")
+        strategy.addItem("Сворачивать окна Chrome (игра замирает)", "minimize")
+        strategy.setCurrentIndex(0 if x.get("desktop_strategy", "offscreen") == "offscreen" else 1)
+        f.addRow(on)
+        f.addRow("Название", name)
+        f.addRow("Клавиша", hk)
+        f.addRow("Что это", mode)
+        f.addRow("Часть заголовка окна", title)
+        f.addRow("Как показывать рабочий стол", strategy)
+        row = {"box": box, "src": x, "enabled": on, "name": name, "hotkey": hk, "mode": mode, "title": title,
+               "strategy": strategy, "index": i}
+
+        def update(*_):
+            enabled = on.isChecked()
+            desktop = mode.currentData() == "desktop"
+            for wid in (name, hk, mode):
+                wid.setEnabled(enabled)
+            title.setEnabled(enabled and not desktop)
+            strategy.setEnabled(enabled and desktop)
+            box.setTitle(f"Окно {self.win_count.value() + i}")
+
+        on.toggled.connect(update)
+        mode.currentIndexChanged.connect(update)
+        self.win_count.valueChanged.connect(update)  # номер окна идёт после окон Chrome
+        update()
+        self._insert(self.extra_list, box)
+        self.extra_rows.append(row)
+
+    def _extra_count_changed(self, n: int) -> None:
+        while len(self.extra_rows) < n:
+            self._add_extra_row(config.extra_window(len(self.extra_rows) + 1))
+        for i, row in enumerate(self.extra_rows):
+            row["box"].setVisible(i < n)
+
     def _take_current_ip(self) -> None:
         self.ks_allowed.setText(self._current_ip)
 
@@ -863,14 +1000,23 @@ class SettingsDialog(QDialog):
 
     def _save(self) -> None:
         cfg = self.cfg
-        for w, (name, url, hk) in zip(cfg["windows"], self.win_rows):
-            w["name"], w["url"], w["hotkey"] = name.text().strip() or w["name"], url.text().strip(), hk.text()
-        s6 = cfg["slot6"]
-        s6["name"] = self.s6_name.text().strip() or s6["name"]
-        s6["hotkey"] = self.s6_hotkey.text()
-        s6["mode"] = self.s6_mode.currentData()
-        s6["window_title"] = self.s6_title.currentText().strip()
-        s6["desktop_strategy"] = self.s6_strategy.currentData()
+        windows = []
+        for i, row in enumerate(self.win_rows[:self.win_count.value()], start=1):
+            w = dict(row["src"])
+            w.update(name=row["name"].text().strip() or f"Окно {i}", url=row["url"].text().strip(),
+                     hotkey=row["hotkey"].text(), enabled=row["enabled"].isChecked())
+            windows.append(w)
+        extra = []
+        for i, row in enumerate(self.extra_rows[:self.extra_count.value()], start=1):
+            x = dict(row["src"])
+            x.update(name=row["name"].text().strip() or config.extra_window(i)["name"], hotkey=row["hotkey"].text(),
+                     enabled=row["enabled"].isChecked(), mode=row["mode"].currentData(),
+                     window_title=row["title"].currentText().strip(), desktop_strategy=row["strategy"].currentData())
+            if x["enabled"] and x["mode"] == "window" and not x["window_title"]:
+                QMessageBox.warning(self, "Panel6", f"«{x['name']}»: укажи часть заголовка окна программы.")
+                return
+            extra.append(x)
+        cfg["windows"], cfg["extra_windows"] = windows, extra
         cfg["hotkeys"] = {name: edit.text() for name, edit in self.hk.items()}
         cfg["game_monitor"] = self.game_mon.currentIndex()
         cfg["panel_monitor"] = self.panel_mon.currentIndex()
@@ -883,7 +1029,7 @@ class SettingsDialog(QDialog):
             return
         cfg["kill_switch"] = {"enabled": self.ks_on.isChecked(), "public_ip": self.ks_public.isChecked(),
                               "interval_sec": self.ks_every.value(), "allowed_ips": ", ".join(allowed)}
-        all_keys = [w["hotkey"] for w in cfg["windows"]] + [s6["hotkey"]] + list(cfg["hotkeys"].values())
+        all_keys = [w["hotkey"] for w in windows + extra if w["enabled"]] + list(cfg["hotkeys"].values())
         used = [k for k in all_keys if k]
         dupes = sorted({k for k in used if used.count(k) > 1})
         if dupes:

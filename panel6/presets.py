@@ -11,6 +11,7 @@ import os
 import re
 from pathlib import Path
 
+from .config import MAX_WINDOWS
 from .macros import normalize_macro
 
 log = logging.getLogger(__name__)
@@ -30,7 +31,8 @@ def normalize_preset(data: dict, name: str | None = None) -> dict:
         macros.append(m)
     ids = {m["id"] for m in macros}
     wm = data.get("window_macros") or {}
-    window_macros = {str(i): (wm.get(str(i)) if wm.get(str(i)) in ids else "") for i in range(1, 6)}
+    # основной макрос для каждого окна Chrome; пустые записи не хранятся
+    window_macros = {str(i): wm.get(str(i)) for i in range(1, MAX_WINDOWS + 1) if wm.get(str(i)) in ids}
     return {"name": str(name or data.get("name") or DEFAULT_NAME).strip() or DEFAULT_NAME,
             "macros": macros, "window_macros": window_macros}
 

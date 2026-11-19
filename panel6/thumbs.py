@@ -21,6 +21,8 @@ class ThumbHost:
 
     def sync(self, sources: dict[int, int | None]) -> None:
         """sources: {слот: hwnd источника или None}. Пересоздаёт миниатюры при смене окна."""
+        for slot in [s for s in self.thumbs if s not in sources]:  # окно выключили или убрали
+            self.thumbs.pop(slot).close()
         for slot, hwnd in sources.items():
             cur = self.thumbs.get(slot)
             if cur and (cur.src != hwnd or not win32.is_window(hwnd)):

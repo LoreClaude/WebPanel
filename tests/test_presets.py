@@ -23,7 +23,7 @@ def test_save_load_roundtrip_and_window_macros(tmp_path):
     store.save(p)
     loaded = store.load("Фарм")
     assert [m["name"] for m in loaded["macros"]] == ["A", "B"]
-    assert loaded["window_macros"] == {"1": "m_2", "2": "", "3": "", "4": "", "5": ""}
+    assert loaded["window_macros"] == {"1": "m_2"}
 
 
 def test_duplicate_ids_are_fixed(tmp_path):

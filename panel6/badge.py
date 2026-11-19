@@ -13,7 +13,6 @@ from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen
 from PySide6.QtWidgets import QWidget
 
 from . import win32
-from .config import WINDOW_COUNT
 from .macro_ui import status_text
 
 CORNERS = {
@@ -32,7 +31,7 @@ STATE_ICON = {"running": ("▶", "#5CC48B"), "paused": ("❚❚", "#E5A84E"), "p
 
 
 def badge_content(ctl, slot: int) -> tuple[str, tuple[str, QColor], list[tuple[str, QColor, bool]]]:
-    """Что показать: заголовок, строка макроса текущего окна и значки окон 1–5 (текст, цвет, текущее ли)."""
+    """Что показать: заголовок, строка макроса текущего окна и значки включённых окон Chrome (текст, цвет, текущее ли)."""
     title = f"{slot}  {ctl.slot_name(slot)}"
     if ctl.recording_slot == slot:
         line = (f"● запись: {ctl.recording_count} действий", QColor("#FF8B82"))
@@ -41,7 +40,7 @@ def badge_content(ctl, slot: int) -> tuple[str, tuple[str, QColor], list[tuple[s
         active = st and st.get("state") in STATE_ICON
         line = (status_text(st) if active else "макрос не запущен", INK if active else DIM)
     marks = []
-    for s in range(1, WINDOW_COUNT + 1):
+    for s in ctl.enabled_chrome_slots():
         state = "recording" if ctl.recording_slot == s else (ctl.macro_states.get(s) or {}).get("state", "")
         icon, color = STATE_ICON.get(state, ("·", DIM.name()))
         marks.append((f"{s}{icon}", QColor(color), s == slot))

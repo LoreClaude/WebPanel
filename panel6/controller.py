@@ -1,4 +1,6 @@
-"""Логика панели: слоты 1–5 — копии Chrome, слот 6 — рабочий стол или выбранная программа.
+"""Логика панели: слоты 1..N — копии Chrome, за ними — рабочие столы и окна выбранных программ.
+
+Сколько окон каждого вида и какие из них включены — задаётся в настройках.
 
 Здесь же запуск макросов в окнах, запись, наборы настроек и все горячие клавиши.
 """
@@ -22,8 +24,6 @@ from .presets import PresetStore
 from .recorder import Recorder
 
 log = logging.getLogger(__name__)
-SLOTS = 6
-DESKTOP_SLOT = 6
 
 HOTKEY_TITLES = {
     "grid": "сетка", "back": "назад", "next": "следующее окно", "prev": "предыдущее окно",
@@ -40,25 +40,38 @@ def ordered_screens():
 
 
 class SlotHistory:
-    """Текущее и предыдущее окно — для «назад» и перебора по кругу."""
+    """Текущее и предыдущее окно — для «назад» и перебора по кругу.
 
-    def __init__(self, count: int = SLOTS):
-        self.count = count
+    slots — число окон (1..count) или функция, которая возвращает список включённых окон.
+    """
+
+    def __init__(self, slots=6):
+        self._slots = slots
         self.current: int | None = None
         self.previous: int | None = None
+
+    def slots(self) -> list[int]:
+        s = self._slots
+        return list(s()) if callable(s) else list(range(1, s + 1))
 
     def visit(self, slot: int) -> None:
         if slot != self.current:
             self.previous, self.current = self.current, slot
 
     def back(self) -> int | None:
-        return self.previous
+        return self.previous if self.previous in self.slots() else None
 
-    def step(self, delta: int) -> int:
-        start = self.current or (1 if delta > 0 else self.count)
-        if self.current is None:
-            return start
-        return (start - 1 + delta) % self.count + 1
+    def step(self, delta: int) -> int | None:
+        slots = self.slots()
+        if not slots:
+            return None
+        if self.current not in slots:
+            if self.current is None:
+                return slots[0] if delta > 0 else slots[-1]
+            # текущее окно выключили: ближайшее включённое в нужную сторону
+            after = [s for s in slots if (s > self.current if delta > 0 else s < self.current)]
+            return (after[0] if delta > 0 else after[-1]) if after else (slots[0] if delta > 0 else slots[-1])
+        return slots[(slots.index(self.current) + delta) % len(slots)]
 
 
 class Controller(QObject):
@@ -79,8 +92,10 @@ class Controller(QObject):
     def __init__(self, cfg: dict):
         super().__init__()
         self.cfg = cfg
-        self.windows = [ChromeWindow(i) for i in range(1, config.WINDOW_COUNT + 1)]
-        self.history = SlotHistory()
+        self._chrome: dict[int, ChromeWindow] = {}  # все когда-либо созданные копии Chrome, в т. ч. убранные из настроек
+        self.windows: list[ChromeWindow] = []
+        self.sync_windows()
+        self.history = SlotHistory(self.enabled_slots)
         self.statuses: dict[int, str] = {}
         self.parked = False  # окна Chrome убраны ради рабочего стола
         self.hotkeys: win32.HotkeyThread | None = None
@@ -125,6 +140,59 @@ class Controller(QObject):
         idx = self.cfg.get("panel_monitor", 1)
         return screens[idx] if 0 <= idx < len(screens) else screens[-1]
 
+    # ------------------------------------------------------------ окна из настроек
+    def sync_windows(self) -> None:
+        """Число окон Chrome изменилось в настройках: добавить новые, убрать лишние (их макросы останавливаются).
+
+        Убранные копии Chrome не закрываются, но остаются под присмотром kill switch.
+        """
+        n = len(self.cfg["windows"])
+        for i in range(1, n + 1):
+            if i not in self._chrome:
+                self._chrome[i] = ChromeWindow(i)
+        for i, r in list(getattr(self, "runners", {}).items()):
+            if i > n and r.active:
+                r.stop("окно убрано в настройках")
+        self.windows = [self._chrome[i] for i in range(1, n + 1)]
+        if hasattr(self, "history"):
+            for attr in ("current", "previous"):
+                if getattr(self.history, attr) not in self.enabled_slots():
+                    setattr(self.history, attr, None)
+        if getattr(self, "grid_focus_slot", None) not in (None, *self.enabled_slots()):
+            self.grid_focus_slot = None
+
+    def chrome_count(self) -> int:
+        return len(self.cfg["windows"])
+
+    def slot_count(self) -> int:
+        return len(self.cfg["windows"]) + len(self.cfg["extra_windows"])
+
+    def is_chrome(self, slot: int) -> bool:
+        return 1 <= slot <= self.chrome_count()
+
+    def is_extra(self, slot: int) -> bool:
+        return self.chrome_count() < slot <= self.slot_count()
+
+    def slot_cfg(self, slot: int) -> dict:
+        n = self.chrome_count()
+        return self.cfg["windows"][slot - 1] if slot <= n else self.cfg["extra_windows"][slot - n - 1]
+
+    def slot_enabled(self, slot: int) -> bool:
+        return 1 <= slot <= self.slot_count() and bool(self.slot_cfg(slot).get("enabled", True))
+
+    def enabled_slots(self) -> list[int]:
+        return [s for s in range(1, self.slot_count() + 1) if self.slot_enabled(s)]
+
+    def enabled_chrome_slots(self) -> list[int]:
+        return [s for s in range(1, self.chrome_count() + 1) if self.slot_enabled(s)]
+
+    def is_desktop(self, slot: int) -> bool:
+        """Окно-«рабочий стол» (а не окно Chrome или программы)."""
+        return self.is_extra(slot) and self.slot_cfg(slot).get("mode") == "desktop"
+
+    def slot_hotkey(self, slot: int) -> str:
+        return self.slot_cfg(slot).get("hotkey", "") if 1 <= slot <= self.slot_count() else ""
+
     # ------------------------------------------------------------ горячие клавиши
     def hotkey_title(self, name: str) -> str:
         if name.startswith("slot"):
@@ -136,8 +204,7 @@ class Controller(QObject):
 
     def bindings(self) -> dict[str, tuple[int, int]]:
         """Все горячие клавиши; ошибочные и повторяющиеся пропускаются и попадают в hotkey_errors."""
-        raw = {f"slot{i}": w["hotkey"] for i, w in enumerate(self.cfg["windows"], start=1)}
-        raw["slot6"] = self.cfg["slot6"]["hotkey"]
+        raw = {f"slot{s}": self.slot_hotkey(s) for s in self.enabled_slots()}
         raw.update(self.cfg["hotkeys"])
         for m in self.preset["macros"]:
             raw[f"macro:{m['id']}"] = m["hotkey"]
@@ -184,10 +251,10 @@ class Controller(QObject):
             prev = self.history.back()
             if prev:
                 self.activate(prev)
-        elif name == "next":
-            self.activate(self.history.step(+1))
-        elif name == "prev":
-            self.activate(self.history.step(-1))
+        elif name in ("next", "prev"):
+            slot = self.history.step(+1 if name == "next" else -1)
+            if slot:
+                self.activate(slot)
         elif name == "macro_toggle":
             self.toggle_current_macro()
         elif name == "stop_all":
@@ -208,14 +275,18 @@ class Controller(QObject):
     def _refresh_worker(self) -> None:
         statuses = {}
         try:
-            for w in self.windows:
+            for w in list(self.windows):
                 try:
                     statuses[w.index] = w.refresh()
                 except Exception as e:  # noqa: BLE001
                     log.warning("окно %s: %s", w.index, e)
                     statuses[w.index] = "off"
-            ok6 = self.cfg["slot6"]["mode"] == "desktop" or self.slot6_hwnd()
-            statuses[DESKTOP_SLOT] = "ready" if ok6 else "missing"
+            n = len(self.windows)
+            for i, x in enumerate(list(self.cfg["extra_windows"]), start=n + 1):
+                if not x.get("enabled", True):
+                    continue
+                ok = x.get("mode") == "desktop" or self._extra_hwnd(x)
+                statuses[i] = "ready" if ok else "missing"
         finally:
             try:
                 self._refreshed.emit(statuses)
@@ -229,22 +300,25 @@ class Controller(QObject):
             self.statuses_changed.emit(statuses)
 
     def chrome_pids(self) -> set[int]:
-        return {w.pid for w in self.windows if w.pid}
+        return {w.pid for w in list(self._chrome.values()) if w.pid}
 
-    def slot6_hwnd(self) -> int | None:
-        s6 = self.cfg["slot6"]
-        if s6["mode"] != "window":
+    def _extra_hwnd(self, x: dict) -> int | None:
+        if x.get("mode") != "window" or not x.get("window_title", "").strip():
             return None
-        return win32.find_window_by_title(s6["window_title"], self.chrome_pids())
+        return win32.find_window_by_title(x["window_title"], self.chrome_pids())
 
     def slot_hwnd(self, slot: int) -> int | None:
-        if slot == DESKTOP_SLOT:
-            return self.slot6_hwnd()
+        if self.is_extra(slot):
+            return self._extra_hwnd(self.slot_cfg(slot))
+        if not self.is_chrome(slot):
+            return None
         w = self.windows[slot - 1]
         return w.hwnd if win32.is_window(w.hwnd) else None
 
     def slot_name(self, slot: int) -> str:
-        return self.cfg["slot6"]["name"] if slot == DESKTOP_SLOT else self.cfg["windows"][slot - 1]["name"]
+        if 1 <= slot <= self.slot_count():
+            return self.slot_cfg(slot)["name"]
+        return f"Окно {slot}"
 
     def foreground_slot(self) -> int | None:
         """Окно Chrome, которое сейчас на переднем плане; None — впереди другая программа."""
@@ -256,10 +330,10 @@ class Controller(QObject):
         slot = self.foreground_slot()
         if slot:
             return slot
-        if self.grid_focus_slot and self.grid_focus_slot != DESKTOP_SLOT:
+        if self.grid_focus_slot and self.is_chrome(self.grid_focus_slot):
             return self.grid_focus_slot
         cur = self.history.current
-        return cur if cur and cur != DESKTOP_SLOT else None
+        return cur if cur and self.is_chrome(cur) else None
 
     # ------------------------------------------------------------ запуск окон
     def allowed_ips(self) -> list[str]:
@@ -269,7 +343,11 @@ class Controller(QObject):
         self.launch_slots([slot])
 
     def launch_all(self) -> None:
-        self.launch_slots(list(range(1, config.WINDOW_COUNT + 1)))
+        slots = self.enabled_chrome_slots()
+        if not slots:
+            self.message.emit("Нет включённых окон Chrome (Настройки → Окна Chrome)")
+            return
+        self.launch_slots(slots)
 
     def launch_slots(self, slots: list[int]) -> None:
         """Запуск окон. Если заданы разрешённые IP — только после свежей проверки внешнего IP (в фоне)."""
@@ -303,11 +381,15 @@ class Controller(QObject):
             return
         r = self.game_rect()
         for slot in slots:
+            if not self.is_chrome(slot):
+                continue
             self.windows[slot - 1].launch(chrome, self.cfg["windows"][slot - 1]["url"],
                                           (r.x(), r.y(), r.width(), r.height()))
             self.message.emit(f"Запускаю {self.slot_name(slot)}…")
 
     def fullscreen(self, slot: int) -> None:
+        if not self.is_chrome(slot):
+            return
         r = self.game_rect()
         w = self.windows[slot - 1]
         try:
@@ -320,7 +402,7 @@ class Controller(QObject):
         if not self.parked:
             return
         r = self.game_rect()
-        for w in self.windows:
+        for w in list(self._chrome.values()):
             if not win32.is_window(w.hwnd):
                 continue
             if win32.is_minimized(w.hwnd):
@@ -329,11 +411,10 @@ class Controller(QObject):
                 win32.move_window(w.hwnd, r.x(), r.y())
         self.parked = False
 
-    def _park(self) -> None:
-        strategy = self.cfg["slot6"].get("desktop_strategy", "offscreen")
+    def _park(self, strategy: str = "offscreen") -> None:
         x = win32.virtual_screen_right() + 200
         y = self.game_rect().y()
-        for w in self.windows:
+        for w in list(self._chrome.values()):
             if not win32.is_window(w.hwnd):
                 continue
             if strategy == "minimize":
@@ -343,19 +424,22 @@ class Controller(QObject):
         self.parked = True
 
     def activate(self, slot: int) -> None:
-        if not 1 <= slot <= SLOTS:
+        if not 1 <= slot <= self.slot_count():
             return
-        if slot == DESKTOP_SLOT and self.cfg["slot6"]["mode"] == "desktop":
-            self._park()
+        if not self.slot_enabled(slot):
+            self.message.emit(f"{self.slot_name(slot)}: окно выключено в настройках")
+            return
+        if self.is_desktop(slot):
+            self._park(self.slot_cfg(slot).get("desktop_strategy", "offscreen"))
             win32.show_desktop_shell()
             self._visited(slot)
             return
         hwnd = self.slot_hwnd(slot)
         if not hwnd:
-            what = "окно не найдено (проверь название в настройках)" if slot == DESKTOP_SLOT else "не запущено"
+            what = "окно не найдено (проверь название в настройках)" if self.is_extra(slot) else "не запущено"
             self.message.emit(f"{self.slot_name(slot)}: {what}")
             return
-        if slot != DESKTOP_SLOT:
+        if self.is_chrome(slot):
             self._unpark()
         win32.activate(hwnd)
         self._visited(slot)
@@ -402,7 +486,7 @@ class Controller(QObject):
     def user_active(self, slot: int) -> bool:
         """Ты сейчас действуешь в этом окне: было касание мыши или клавиатуры, пока оно активно."""
         idle_ms = float(self.cfg["macro_user_input"].get("idle_sec", 1.0)) * 1000
-        if win32.last_input_age_ms() >= idle_ms:
+        if win32.last_input_age_ms() >= idle_ms or not self.is_chrome(slot):
             return False
         w = self.windows[slot - 1]
         fg = win32.foreground_window()
@@ -423,6 +507,10 @@ class Controller(QObject):
         m = self.macro(mid)
         if not m:
             self.message.emit("Макрос не найден")
+            return False
+        if not self.is_chrome(slot):
+            if not quiet:
+                self.message.emit(f"Окна Chrome {slot} нет (Настройки → Окна Chrome)")
             return False
         w = self.windows[slot - 1]
         if not w.connected:
@@ -450,8 +538,9 @@ class Controller(QObject):
         m = self.macro(mid)
         if not m:
             return
-        started = [slot for slot in m["windows"] if self.run_macro(slot, mid, quiet=True)]
-        skipped = [str(s) for s in m["windows"] if s not in started]
+        targets = [s for s in m["windows"] if s in self.enabled_chrome_slots()]
+        started = [slot for slot in targets if self.run_macro(slot, mid, quiet=True)]
+        skipped = [str(s) for s in targets if s not in started]
         text = f"«{m['name']}» запущен в окнах: {', '.join(map(str, started)) or 'ни в одном'}"
         if skipped:
             text += f" (не запущены: {', '.join(skipped)})"
@@ -520,6 +609,8 @@ class Controller(QObject):
         """Начинает запись в окне. sink(steps) получит шаги; без sink запись станет новым макросом."""
         if self.recorder:
             self.message.emit("Запись уже идёт")
+            return False
+        if not self.is_chrome(slot):
             return False
         w = self.windows[slot - 1]
         if not w.connected:
@@ -592,11 +683,11 @@ class Controller(QObject):
         self.net_killed.emit(what, self.kill_windows("kill switch: сменилось подключение к интернету"))
 
     def kill_windows(self, reason: str) -> list[int]:
-        """Останавливает макросы и мгновенно завершает окна Chrome 1–5. Возвращает номера закрытых окон."""
+        """Останавливает макросы и мгновенно завершает все окна Chrome. Возвращает номера закрытых окон."""
         for r in list(self.runners.values()):
             if r.active:
                 r.stop(reason)
-        return [w.index for w in self.windows if w.kill()]
+        return [w.index for w in list(self._chrome.values()) if w.kill()]
 
     def _after_kill(self, _what: str, _closed: list) -> None:
         if self.recorder:

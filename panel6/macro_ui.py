@@ -715,8 +715,8 @@ class MacrosDialog(QDialog):
         wg.addWidget(QLabel("Повторов в этом окне"), 0, 2)
         wg.addWidget(QLabel("Пауза между повторами"), 0, 3)
         self.win_rows = []
-        for i in range(1, 6):
-            on = QCheckBox(f"{i}. {ctl.cfg['windows'][i - 1]['name']}")
+        for i, wcfg in enumerate(ctl.cfg["windows"], start=1):
+            on = QCheckBox(f"{i}. {wcfg['name']}" + ("" if wcfg.get("enabled", True) else " (выключено)"))
             cnt = QSpinBox()
             cnt.setRange(-1, MAX_REPEAT)
             cnt.setSpecialValueText("как у макроса")
@@ -807,8 +807,9 @@ class MacrosDialog(QDialog):
 
         # --- запись и проверка
         self.window_pick = QComboBox()
-        for i in range(1, 6):
-            self.window_pick.addItem(f"{i}. {ctl.cfg['windows'][i - 1]['name']}", i)
+        for i, wcfg in enumerate(ctl.cfg["windows"], start=1):
+            if wcfg.get("enabled", True):
+                self.window_pick.addItem(f"{i}. {wcfg['name']}", i)
         self.window_pick.currentIndexChanged.connect(self._window_picked)
         self.b_rec = QPushButton("● Записать")
         self.b_rec.clicked.connect(self._toggle_record)
@@ -918,7 +919,7 @@ class MacrosDialog(QDialog):
             return
         mid = self.current["id"]
         self.ctl.preset["macros"] = [m for m in self.ctl.preset["macros"] if m["id"] != mid]
-        for k, v in self.ctl.preset["window_macros"].items():
+        for k, v in list(self.ctl.preset["window_macros"].items()):
             if v == mid:
                 self.ctl.preset["window_macros"][k] = ""
         self._history.pop(mid, None)
@@ -967,8 +968,11 @@ class MacrosDialog(QDialog):
         m["hotkey_target"] = self.target.currentData()
         m["repeat"] = {"count": self.count.value(), "gap_ms": self.gap.value()}
         m["user_input"] = self.user_input.currentData()
-        m["windows"] = [i for i, (on, _c, _g) in enumerate(self.win_rows, start=1) if on.isChecked()]
-        overrides = {}
+        n = len(self.win_rows)
+        # окна, которых сейчас нет в настройках (их число уменьшили), остаются как были
+        m["windows"] = [i for i, (on, _c, _g) in enumerate(self.win_rows, start=1) if on.isChecked()] + \
+            [w for w in m["windows"] if w > n]
+        overrides = {k: v for k, v in m["overrides"].items() if int(k) > n}
         for i, (_on, cnt, gap) in enumerate(self.win_rows, start=1):
             o = {}
             if cnt.value() >= 0:
@@ -1205,13 +1209,15 @@ class MacrosDialog(QDialog):
         self.tool_note.setText("Отменено" if which == 0 else "Повторено")
 
     def _shot(self) -> bytes | None:
+        if not self.ctl.is_chrome(self._slot()):
+            return None
         w = self.ctl.windows[self._slot() - 1]
         if not w.connected:
             return None
         return w.screenshot()
 
     def _slot(self) -> int:
-        return self.window_pick.currentData()
+        return self.window_pick.currentData() or 0
 
     def _add_step(self, t: str) -> None:
         if not self.current:

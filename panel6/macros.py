@@ -18,6 +18,8 @@ import threading
 import time
 from typing import Callable, Protocol
 
+from .config import MAX_WINDOWS
+
 log = logging.getLogger(__name__)
 
 BUTTONS = {"left": "ЛКМ", "right": "ПКМ", "middle": "СКМ"}
@@ -183,10 +185,11 @@ def normalize_macro(m: dict) -> dict:
         except ValueError as e:
             log.warning("макрос %s: пропущен шаг: %s", m.get("name"), e)
     rep = m.get("repeat") or {}
-    windows = [w for w in (m.get("windows") or [1, 2, 3, 4, 5]) if isinstance(w, int) and 1 <= w <= 5]
+    windows = [w for w in (m.get("windows") or [1, 2, 3, 4, 5])
+               if isinstance(w, int) and not isinstance(w, bool) and 1 <= w <= MAX_WINDOWS]
     overrides = {}
     for key, ov in (m.get("overrides") or {}).items():
-        if str(key) in {"1", "2", "3", "4", "5"} and isinstance(ov, dict):
+        if str(key).isdigit() and 1 <= int(key) <= MAX_WINDOWS and isinstance(ov, dict):
             o = {}
             if ov.get("count") is not None:
                 o["count"] = _num(ov.get("count"), 1, 0, MAX_REPEAT, int)

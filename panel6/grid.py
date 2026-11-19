@@ -1,4 +1,4 @@
-"""Сетка «все окна»: полноэкранный слой поверх игрового монитора с живыми миниатюрами 3×2.
+"""Сетка «все окна»: полноэкранный слой поверх игрового монитора с живыми миниатюрами всех включённых окон.
 
 Клик и перетаскивание в миниатюре окна Chrome уходят в настоящее окно, клавиши — в выбранное окно.
 Двойной клик — развернуть окно, Esc или клавиша сетки — закрыть.
@@ -7,12 +7,13 @@
 from __future__ import annotations
 
 import logging
+import math
 
 from PySide6.QtCore import QRectF, Qt
 from PySide6.QtGui import QColor, QFont, QKeyEvent, QMouseEvent, QPainter, QPen, QWheelEvent
 from PySide6.QtWidgets import QWidget
 
-from .controller import DESKTOP_SLOT, SLOTS, Controller
+from .controller import Controller
 from .geometry import Rect, grid_cells, to_page
 from .keys import cdp_key, parse_hotkey
 from .thumbs import ThumbHost
@@ -24,6 +25,14 @@ CELL = QColor("#151E28")
 INK = QColor("#DCE5EF")
 DIM = QColor("#8C9BAD")
 ACCENT = QColor("#7FA3FF")
+
+def grid_shape(n: int) -> tuple[int, int]:
+    """Столбцы и строки сетки для n окон: 6 → 3×2, 4 → 2×2, 8 → 3×3, 10 → 4×3."""
+    if n <= 0:
+        return 1, 1
+    cols = math.ceil(math.sqrt(n))
+    return cols, math.ceil(n / cols)
+
 
 _BUTTONS = {Qt.LeftButton: ("left", 1), Qt.RightButton: ("right", 2), Qt.MiddleButton: ("middle", 4)}
 
@@ -37,6 +46,7 @@ class GridOverlay(QWidget):
         self.setMouseTracking(False)
         self.host = ThumbHost(self)
         self.cells: list[Rect] = []
+        self.slots: list[int] = []  # какое окно в какой клетке
         self.thumb_rects: dict[int, Rect] = {}
         self.selected: int | None = None
         self.drag_slot: int | None = None
@@ -67,11 +77,13 @@ class GridOverlay(QWidget):
     def relayout(self) -> None:
         if not self.isVisible():
             return
-        self.cells = grid_cells(self.width(), self.height() - 22, gap=14, margin=14)
-        self.host.sync({s: self.ctl.slot_hwnd(s) for s in range(1, SLOTS + 1)})
+        self.slots = self.ctl.enabled_slots()
+        cols, rows = grid_shape(len(self.slots))
+        self.cells = grid_cells(self.width(), self.height() - 22, cols=cols, rows=rows, gap=14, margin=14)
+        self.host.sync({s: self.ctl.slot_hwnd(s) for s in self.slots})
         self.thumb_rects.clear()
         self.page_sizes.clear()
-        for slot, cell in enumerate(self.cells, start=1):
+        for slot, cell in zip(self.slots, self.cells):
             area = Rect(cell.x, cell.y + LABEL_H, cell.w, cell.h - LABEL_H)
             r = self.host.place(slot, area)
             if r:
@@ -89,10 +101,13 @@ class GridOverlay(QWidget):
         f = QFont(self.font())
         f.setPointSizeF(11)
         p.setFont(f)
-        for slot, cell in enumerate(self.cells, start=1):
+        if not self.slots:
+            p.setPen(DIM)
+            p.drawText(QRectF(self.rect()), Qt.AlignCenter, "Все окна выключены в настройках")
+        for slot, cell in zip(self.slots, self.cells):
             p.fillRect(QRectF(cell.x, cell.y, cell.w, cell.h), CELL)
             name = self.ctl.slot_name(slot)
-            hk = self.ctl.cfg["slot6"]["hotkey"] if slot == DESKTOP_SLOT else self.ctl.cfg["windows"][slot - 1]["hotkey"]
+            hk = self.ctl.slot_hotkey(slot)
             p.setPen(INK)
             p.drawText(QRectF(cell.x + 10, cell.y, cell.w - 120, LABEL_H), Qt.AlignVCenter | Qt.AlignLeft, f"{slot}  {name}")
             p.setPen(DIM)
@@ -104,7 +119,7 @@ class GridOverlay(QWidget):
                     "starting": "запускается…",
                     "missing": "окно не найдено",
                 }.get(status, "двойной клик — открыть")
-                if slot == DESKTOP_SLOT and self.ctl.cfg["slot6"]["mode"] == "desktop":
+                if self.ctl.is_desktop(slot):
                     text = "рабочий стол\nдвойной клик — открыть"
                 p.drawText(QRectF(cell.x, cell.y + LABEL_H, cell.w, cell.h - LABEL_H), Qt.AlignCenter, text)
             if slot == self.selected:
@@ -116,14 +131,14 @@ class GridOverlay(QWidget):
 
     # ------------------------------------------------------------ мышь
     def _slot_at(self, x: float, y: float) -> int | None:
-        for slot, cell in enumerate(self.cells, start=1):
+        for slot, cell in zip(self.slots, self.cells):
             if cell.contains(x, y):
                 return slot
         return None
 
     def _page_point(self, slot: int, x: float, y: float):
         """Точка сетки -> координаты страницы окна Chrome (или None)."""
-        if slot == DESKTOP_SLOT or slot not in self.thumb_rects:
+        if not self.ctl.is_chrome(slot) or slot not in self.thumb_rects:
             return None
         win = self.ctl.windows[slot - 1]
         if slot not in self.page_sizes:
@@ -211,7 +226,7 @@ class GridOverlay(QWidget):
 
     def _send_key(self, kind: str, e: QKeyEvent) -> None:
         slot = self.selected
-        if not slot or slot == DESKTOP_SLOT or e.isAutoRepeat() and kind == "keyUp":
+        if not slot or not self.ctl.is_chrome(slot) or e.isAutoRepeat() and kind == "keyUp":
             return
         params = cdp_key(e.nativeVirtualKey(), e.text())
         if params:

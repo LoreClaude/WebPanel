@@ -707,3 +707,68 @@ def test_launch_waits_for_allowed_ip(ctl, qapp, monkeypatch):
     ctl.cfg["kill_switch"]["allowed_ips"] = ""  # без списка — запуск сразу, без проверки
     ctl.launch(4)
     assert started[-1] == [4]
+
+
+def test_window_count_and_enabled_from_settings(ctl, qapp, monkeypatch):
+    """Число окон Chrome и рабочих столов задаётся в настройках, выключенные окна пропадают отовсюду."""
+    from panel6 import app as app_mod
+    from panel6.app import MainWindow, SettingsDialog
+    from panel6.grid import grid_shape
+
+    warnings = []
+    monkeypatch.setattr(app_mod.QMessageBox, "warning", lambda *a: warnings.append(a[2]))
+
+    win = MainWindow(ctl)
+    assert [c.slot for c in win.cards] == [1, 2, 3, 4, 5, 6]
+    dlg = SettingsDialog(ctl.cfg, win)
+    dlg.win_count.setValue(7)
+    assert len(dlg.win_rows) == 7 and dlg.extra_rows[0]["box"].title() == "Окно 8"
+    dlg.win_rows[1]["enabled"].setChecked(False)
+    dlg.win_rows[6]["hotkey"].setText("F7")
+    dlg.extra_count.setValue(3)
+    dlg.extra_rows[1]["mode"].setCurrentIndex(1)
+    dlg.extra_rows[1]["title"].setCurrentText("Steam")
+    dlg.extra_rows[2]["enabled"].setChecked(False)
+    assert not dlg.extra_rows[0]["title"].isEnabled() and dlg.extra_rows[1]["title"].isEnabled()
+    dlg._save()
+    cfg = dlg.result_cfg
+    assert len(cfg["windows"]) == 7 and cfg["windows"][1]["enabled"] is False
+    assert [x["mode"] for x in cfg["extra_windows"]] == ["desktop", "window", "desktop"]
+    assert cfg["extra_windows"][1]["window_title"] == "Steam" and cfg["extra_windows"][2]["enabled"] is False
+
+    ctl.cfg.clear()
+    ctl.cfg.update(cfg)
+    ctl.sync_windows()
+    win.build_cards()
+    assert ctl.enabled_slots() == [1, 3, 4, 5, 6, 7, 8, 9]
+    assert [c.slot for c in win.cards] == [1, 3, 4, 5, 6, 7, 8, 9]
+    assert len(ctl.windows) == 7 and ctl.is_chrome(7) and ctl.is_desktop(8) and ctl.is_extra(9)
+    assert not ctl.is_desktop(9) and ctl.slot_name(9) == "Рабочий стол 2"
+    binds = ctl.bindings()
+    assert "slot2" not in binds and "slot10" not in binds and {"slot7", "slot8"} <= set(binds)
+    messages = []
+    ctl.message.connect(messages.append)
+    ctl.activate(2)
+    assert messages[-1].endswith("окно выключено в настройках")
+    assert grid_shape(len(ctl.enabled_slots())) == (3, 3) and grid_shape(6) == (3, 2) and grid_shape(4) == (2, 2)
+
+    dlg = SettingsDialog(ctl.cfg, win)
+    dlg.win_count.setValue(3)  # меньше окон — лишние скрываются, но не теряются, пока окно открыто
+    dlg.win_count.setValue(4)
+    assert dlg.win_rows[3]["name"].text() == "Окно 4"
+    dlg.extra_rows[0]["hotkey"].setText("F7")  # уже у окна 7
+    dlg.win_count.setValue(7)
+    dlg.result_cfg = None
+    dlg._save()
+    assert dlg.result_cfg is None and "F7" in warnings[-1]  # повтор клавиши не сохранился
+    win.quitting = True
+    win.badge.timer.stop()
+    win.close()
+
+
+def test_launch_all_only_enabled(ctl, qapp, monkeypatch):
+    ctl.cfg["windows"][0]["enabled"] = False
+    started = []
+    monkeypatch.setattr(ctl, "launch_slots", started.extend)
+    ctl.launch_all()
+    assert started == [2, 3, 4, 5]
