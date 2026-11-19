@@ -144,11 +144,16 @@ class Controller(QObject):
     def sync_windows(self) -> None:
         """Число окон Chrome изменилось в настройках: добавить новые, убрать лишние (их макросы останавливаются).
 
-        Убранные копии Chrome не закрываются, но остаются под присмотром kill switch.
+        Убранные копии Chrome не закрываются, но остаются под присмотром kill switch — и после перезапуска
+        панели: окна с папкой профиля, но без места в настройках, тоже попадают в список на закрытие.
         """
         n = len(self.cfg["windows"])
         for i in range(1, n + 1):
             if i not in self._chrome:
+                self._chrome[i] = ChromeWindow(i)
+        profiles = config.app_dir() / "profiles"
+        for i in range(n + 1, config.MAX_WINDOWS + 1):
+            if i not in self._chrome and (profiles / f"w{i}").is_dir():
                 self._chrome[i] = ChromeWindow(i)
         for i, r in list(getattr(self, "runners", {}).items()):
             if i > n and r.active:

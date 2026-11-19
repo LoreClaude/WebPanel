@@ -772,3 +772,21 @@ def test_launch_all_only_enabled(ctl, qapp, monkeypatch):
     monkeypatch.setattr(ctl, "launch_slots", started.extend)
     ctl.launch_all()
     assert started == [2, 3, 4, 5]
+
+
+def test_kill_switch_covers_windows_removed_from_settings(qapp, tmp_path, monkeypatch):
+    """Окно 8 убрали из настроек, а его Chrome остался открытым: после перезапуска панели kill switch закроет и его."""
+    monkeypatch.setenv("PANEL6_HOME", str(tmp_path))
+    from panel6 import config
+    from panel6.controller import Controller
+
+    (tmp_path / "profiles" / "w8").mkdir(parents=True)
+    c = Controller(config.load())
+    try:
+        assert len(c.windows) == 5 and 8 in c._chrome and 6 not in c._chrome
+        assert c.enabled_chrome_slots() == [1, 2, 3, 4, 5]  # на панели убранного окна нет
+        for w in c._chrome.values():
+            monkeypatch.setattr(w, "kill", lambda: True)
+        assert c.kill_windows("тест") == [1, 2, 3, 4, 5, 8]
+    finally:
+        c.shutdown()
